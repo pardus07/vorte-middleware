@@ -187,40 +187,100 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
 
   /**
    * Handle incoming audio data from the microphone.
-   * Accumulates audio and processes when silence is detected (simplified VAD).
+   * Uses simple VAD (Voice Activity Detection) based on RMS amplitude.
+   *
+   * Key insight: Android sends audio CONTINUOUSLY (including silence),
+   * so we can't just use "no data received" as silence detection.
+   * Instead, we measure the actual audio level of each chunk.
    */
   let audioBuffer = [];
   let silenceTimer = null;
   let audioChunkCount = 0;
-  const SILENCE_TIMEOUT_MS = 1800; // 1.8s of no audio = end of speech
-  const MIN_AUDIO_CHUNKS = 5; // Minimum chunks before processing (avoid noise triggers)
+  let speechChunkCount = 0; // chunks with actual speech (above threshold)
+  let isSpeaking = false;    // user is currently speaking
+  const SILENCE_TIMEOUT_MS = 1200;   // 1.2s of silence after speech = end of utterance
+  const MIN_SPEECH_CHUNKS = 3;      // Minimum speech chunks to be considered real speech
+  const NOISE_THRESHOLD = 500;      // RMS amplitude threshold for speech detection (16-bit PCM)
+
+  /**
+   * Calculate RMS (Root Mean Square) amplitude of 16-bit PCM audio.
+   * Returns a value roughly 0-32768; typical silence is < 200, speech > 500.
+   */
+  function calculateRms(pcmBuffer) {
+    if (pcmBuffer.length < 2) return 0;
+
+    let sumOfSquares = 0;
+    const sampleCount = Math.floor(pcmBuffer.length / 2);
+
+    for (let i = 0; i < pcmBuffer.length - 1; i += 2) {
+      // Read 16-bit signed little-endian sample
+      const sample = pcmBuffer.readInt16LE(i);
+      sumOfSquares += sample * sample;
+    }
+
+    return Math.sqrt(sumOfSquares / sampleCount);
+  }
 
   async function handleAudioData(data) {
     if (!isSetup || isProcessing) return;
 
-    audioBuffer.push(Buffer.from(data));
-    audioChunkCount++;
+    const chunk = Buffer.from(data);
+    const rms = calculateRms(chunk);
 
-    // Reset silence timer
-    if (silenceTimer) clearTimeout(silenceTimer);
-    silenceTimer = setTimeout(async () => {
-      if (audioChunkCount >= MIN_AUDIO_CHUNKS) {
-        await processAccumulatedAudio();
-      } else {
-        // Too little audio — probably noise, discard
-        logger.debug({ deviceId, chunks: audioChunkCount }, "Discarding short audio (noise)");
-        audioBuffer = [];
-        audioChunkCount = 0;
+    const isActiveAudio = rms > NOISE_THRESHOLD;
+
+    if (isActiveAudio) {
+      // User is speaking — accumulate audio
+      audioBuffer.push(chunk);
+      audioChunkCount++;
+      speechChunkCount++;
+      isSpeaking = true;
+
+      // Reset silence timer when we detect speech
+      if (silenceTimer) {
+        clearTimeout(silenceTimer);
+        silenceTimer = null;
       }
-    }, SILENCE_TIMEOUT_MS);
 
-    // Send partial transcript indicator (every 10 chunks to avoid flooding)
-    if (audioChunkCount % 10 === 1) {
-      sendJson(ws, {
-        type: "transcript_partial",
-        content: "Dinleniyor...",
-      });
+      // Send partial transcript indicator (throttled)
+      if (speechChunkCount % 8 === 1) {
+        sendJson(ws, {
+          type: "transcript_partial",
+          content: "Dinleniyor...",
+        });
+      }
+    } else if (isSpeaking) {
+      // User was speaking but now it's silent — keep accumulating
+      // (captures trailing silence to avoid cutting off words)
+      audioBuffer.push(chunk);
+      audioChunkCount++;
+
+      // Start/reset silence countdown
+      if (!silenceTimer) {
+        silenceTimer = setTimeout(async () => {
+          silenceTimer = null;
+          isSpeaking = false;
+
+          if (speechChunkCount >= MIN_SPEECH_CHUNKS) {
+            logger.info(
+              { deviceId, speechChunks: speechChunkCount, totalChunks: audioChunkCount },
+              "Speech ended, processing audio"
+            );
+            await processAccumulatedAudio();
+          } else {
+            // Too little speech — probably noise, discard
+            logger.debug(
+              { deviceId, speechChunks: speechChunkCount, rms: Math.round(rms) },
+              "Discarding short audio (noise)"
+            );
+            audioBuffer = [];
+            audioChunkCount = 0;
+            speechChunkCount = 0;
+          }
+        }, SILENCE_TIMEOUT_MS);
+      }
     }
+    // else: silence and user hasn't started speaking — ignore completely
   }
 
   /**
@@ -239,6 +299,8 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
     const fullPcm = Buffer.concat(audioBuffer);
     audioBuffer = [];
     audioChunkCount = 0;
+    speechChunkCount = 0;
+    isSpeaking = false;
 
     // Check minimum audio size (at least ~0.2s of audio at 16kHz 16-bit mono = 6400 bytes)
     if (fullPcm.length < 6400) {
@@ -432,6 +494,8 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
     // Clear any pending audio processing
     audioBuffer = [];
     audioChunkCount = 0;
+    speechChunkCount = 0;
+    isSpeaking = false;
     if (silenceTimer) {
       clearTimeout(silenceTimer);
       silenceTimer = null;
@@ -446,6 +510,8 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
     isProcessing = false;
     audioBuffer = [];
     audioChunkCount = 0;
+    speechChunkCount = 0;
+    isSpeaking = false;
     if (silenceTimer) {
       clearTimeout(silenceTimer);
       silenceTimer = null;
