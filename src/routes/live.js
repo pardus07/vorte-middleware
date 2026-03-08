@@ -1,5 +1,5 @@
 /**
- * WebSocket /api/live — Gemini Live API Real-time Voice
+ * WebSocket /api/live — Gemini Live Voice Pipeline
  *
  * Protocol:
  *
@@ -19,21 +19,64 @@
  *   { type: "error", content, code }
  *
  * Server → Client (binary frames):
- *   Raw audio bytes from Gemini (AI speech)
+ *   Raw audio bytes from Gemini TTS (AI speech)
  *
  * Architecture:
- *   Android ↔ This WebSocket ↔ Gemini Live API (via SDK)
+ *   1. Android records mic → PCM → WebSocket → Middleware
+ *   2. Middleware accumulates audio (simplified VAD with silence detection)
+ *   3. After silence: PCM → WAV → Gemini generateContent → transcription
+ *   4. Transcription → Gemini chat session → AI response text
+ *   5. (Optional) AI response → Gemini TTS → audio bytes → Android
+ *   6. Android plays audio / shows text
  */
 
-const { GoogleGenerativeAI } = require("@google/generative-ai");
+/**
+ * Convert raw PCM audio buffer to WAV format by prepending the standard WAV header.
+ *
+ * @param {Buffer} pcmBuffer  Raw PCM audio bytes (16-bit signed, little-endian)
+ * @param {number} sampleRate Sample rate in Hz (e.g., 16000)
+ * @param {number} numChannels Number of channels (1 = mono, 2 = stereo)
+ * @param {number} bitsPerSample Bits per sample (16)
+ * @returns {Buffer} Complete WAV file buffer
+ */
+function pcmToWav(pcmBuffer, sampleRate = 16000, numChannels = 1, bitsPerSample = 16) {
+  const dataSize = pcmBuffer.length;
+  const byteRate = sampleRate * numChannels * (bitsPerSample / 8);
+  const blockAlign = numChannels * (bitsPerSample / 8);
+
+  // WAV header is 44 bytes
+  const header = Buffer.alloc(44);
+
+  // RIFF chunk descriptor
+  header.write("RIFF", 0);                          // ChunkID
+  header.writeUInt32LE(36 + dataSize, 4);            // ChunkSize
+  header.write("WAVE", 8);                           // Format
+
+  // "fmt " sub-chunk
+  header.write("fmt ", 12);                          // Subchunk1ID
+  header.writeUInt32LE(16, 16);                      // Subchunk1Size (PCM = 16)
+  header.writeUInt16LE(1, 20);                       // AudioFormat (PCM = 1)
+  header.writeUInt16LE(numChannels, 22);              // NumChannels
+  header.writeUInt32LE(sampleRate, 24);               // SampleRate
+  header.writeUInt32LE(byteRate, 28);                 // ByteRate
+  header.writeUInt16LE(blockAlign, 32);               // BlockAlign
+  header.writeUInt16LE(bitsPerSample, 34);            // BitsPerSample
+
+  // "data" sub-chunk
+  header.write("data", 36);                          // Subchunk2ID
+  header.writeUInt32LE(dataSize, 40);                // Subchunk2Size
+
+  return Buffer.concat([header, pcmBuffer]);
+}
 
 /**
  * Handle a single WebSocket connection for live voice.
  */
 function handleLiveWebSocket(ws, gemini, logger, deviceId) {
-  let session = null;
+  let chatSession = null;
   let isSetup = false;
   let sessionConfig = null;
+  let isProcessing = false;
 
   // ==================== Client Message Handling ====================
 
@@ -48,7 +91,7 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
         await handleControlMessage(message);
       }
     } catch (err) {
-      logger.error({ deviceId, error: err.message }, "Live WS message error");
+      logger.error({ deviceId, error: err.message, stack: err.stack }, "Live WS message error");
       sendJson(ws, {
         type: "error",
         content: err.message || "Processing error",
@@ -89,7 +132,9 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
   }
 
   /**
-   * Setup the Gemini Live session.
+   * Setup the Gemini session.
+   * Creates a CHAT session for conversation continuity (text-only, with history).
+   * Audio transcription is done separately using generateContent.
    */
   async function setupSession(config) {
     if (isSetup) {
@@ -100,45 +145,36 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
     sessionConfig = config;
 
     try {
-      // Create a Gemini model for the live session
-      const modelName = config.model || "gemini-2.5-flash";
-      const model = gemini.getModel(modelName, {
+      // Use gemini-2.5-flash for the chat session (text conversation)
+      const chatModelName = "gemini-2.5-flash";
+      const chatModel = gemini.getModel(chatModelName, {
         generationConfig: {
-          responseModalities: ["AUDIO", "TEXT"],
-          speechConfig: {
-            voiceConfig: {
-              prebuiltVoiceConfig: {
-                voiceName: config.voice_name === "default" ? "Kore" : config.voice_name,
-              },
-            },
-          },
+          maxOutputTokens: 2048,
+          temperature: 0.7,
         },
         ...(config.system_prompt
           ? { systemInstruction: config.system_prompt }
           : {}),
       });
 
-      // Start a chat session for the live interaction
-      session = model.startChat({
-        history: [],
-      });
+      // Start a chat session for multi-turn conversation
+      chatSession = chatModel.startChat({ history: [] });
 
       isSetup = true;
 
       logger.info(
         {
           deviceId,
-          model: modelName,
+          chatModel: chatModelName,
           language: config.language,
           bargeIn: config.enable_barge_in,
         },
         "Live session setup complete"
       );
 
-      // Notify client that setup is complete
-      // (The client transitions to LISTENING state on receiving Connected event)
+      // Client transitions to LISTENING when it receives the Connected event (onOpen)
     } catch (err) {
-      logger.error({ deviceId, error: err.message }, "Session setup failed");
+      logger.error({ deviceId, error: err.message, stack: err.stack }, "Session setup failed");
       sendJson(ws, {
         type: "error",
         content: `Session setup failed: ${err.message}`,
@@ -151,108 +187,186 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
 
   /**
    * Handle incoming audio data from the microphone.
-   * In this implementation, we accumulate audio and process
-   * when silence is detected (simplified VAD).
+   * Accumulates audio and processes when silence is detected (simplified VAD).
    */
   let audioBuffer = [];
   let silenceTimer = null;
-  const SILENCE_TIMEOUT_MS = 1500; // 1.5s of no audio = end of speech
+  let audioChunkCount = 0;
+  const SILENCE_TIMEOUT_MS = 1800; // 1.8s of no audio = end of speech
+  const MIN_AUDIO_CHUNKS = 5; // Minimum chunks before processing (avoid noise triggers)
 
   async function handleAudioData(data) {
-    if (!isSetup) return;
+    if (!isSetup || isProcessing) return;
 
     audioBuffer.push(Buffer.from(data));
+    audioChunkCount++;
 
     // Reset silence timer
     if (silenceTimer) clearTimeout(silenceTimer);
     silenceTimer = setTimeout(async () => {
-      await processAccumulatedAudio();
+      if (audioChunkCount >= MIN_AUDIO_CHUNKS) {
+        await processAccumulatedAudio();
+      } else {
+        // Too little audio — probably noise, discard
+        logger.debug({ deviceId, chunks: audioChunkCount }, "Discarding short audio (noise)");
+        audioBuffer = [];
+        audioChunkCount = 0;
+      }
     }, SILENCE_TIMEOUT_MS);
 
-    // Send partial transcript indicator
-    sendJson(ws, {
-      type: "transcript_partial",
-      content: "...",
-    });
+    // Send partial transcript indicator (every 10 chunks to avoid flooding)
+    if (audioChunkCount % 10 === 1) {
+      sendJson(ws, {
+        type: "transcript_partial",
+        content: "Dinleniyor...",
+      });
+    }
   }
 
   /**
-   * Process accumulated audio: send to Gemini for transcription + response.
+   * Process accumulated audio:
+   * 1. Convert PCM → WAV
+   * 2. Send to Gemini for transcription (generateContent with audio)
+   * 3. Send transcription to chat session for response
+   * 4. Return transcript + response to client
    */
   async function processAccumulatedAudio() {
-    if (audioBuffer.length === 0 || !session) return;
+    if (audioBuffer.length === 0 || !chatSession) return;
+    if (isProcessing) return;
 
-    const fullAudio = Buffer.concat(audioBuffer);
+    isProcessing = true;
+
+    const fullPcm = Buffer.concat(audioBuffer);
     audioBuffer = [];
+    audioChunkCount = 0;
+
+    // Check minimum audio size (at least ~0.2s of audio at 16kHz 16-bit mono = 6400 bytes)
+    if (fullPcm.length < 6400) {
+      logger.debug({ deviceId, bytes: fullPcm.length }, "Audio too short, skipping");
+      isProcessing = false;
+      return;
+    }
+
+    logger.info({ deviceId, audioBytes: fullPcm.length, durationSec: (fullPcm.length / 32000).toFixed(1) }, "Processing audio");
+
+    // Notify client we're processing
+    sendJson(ws, { type: "transcript_partial", content: "İşleniyor..." });
 
     try {
-      // Convert audio to base64 for Gemini
-      const audioBase64 = fullAudio.toString("base64");
+      // ── Step 1: Convert PCM to WAV ──
+      const wavBuffer = pcmToWav(fullPcm, 16000, 1, 16);
+      const audioBase64 = wavBuffer.toString("base64");
 
-      // Send audio to Gemini as inline data
-      const result = await session.sendMessage([
+      // ── Step 2: Transcribe audio using Gemini ──
+      const transcribeModel = gemini.getModel("gemini-2.0-flash", {
+        generationConfig: {
+          maxOutputTokens: 256,
+          temperature: 0.1, // Low temperature for accurate transcription
+        },
+      });
+
+      const transcribeResult = await transcribeModel.generateContent([
         {
           inlineData: {
-            mimeType: "audio/pcm;rate=16000",
+            mimeType: "audio/wav",
             data: audioBase64,
           },
         },
+        {
+          text: "Bu ses kaydında kullanıcı ne söylüyor? Sadece söylediğini yaz, başka hiçbir şey ekleme. Eğer ses anlaşılmıyorsa veya sessizse sadece [anlaşılmadı] yaz.",
+        },
       ]);
 
-      const response = result.response;
+      const transcript = transcribeResult.response.text().trim();
 
-      // Send final transcript (if we got text back)
-      const textParts = response.candidates?.[0]?.content?.parts?.filter(
-        (p) => p.text
-      );
+      logger.info({ deviceId, transcript }, "Audio transcribed");
 
-      if (textParts?.length) {
-        const responseText = textParts.map((p) => p.text).join("");
-
-        // Send transcript final
-        sendJson(ws, {
-          type: "transcript_final",
-          content: "Ses mesaji",
-        });
-
-        // Send response text
-        sendJson(ws, {
-          type: "response_text",
-          content: responseText,
-        });
+      // Check if transcription is empty or unintelligible
+      if (!transcript || transcript === "[anlaşılmadı]" || transcript.length < 2) {
+        logger.info({ deviceId }, "Transcription empty or unintelligible, skipping");
+        sendJson(ws, { type: "response_end" });
+        isProcessing = false;
+        return;
       }
 
-      // Check for audio response
-      const audioParts = response.candidates?.[0]?.content?.parts?.filter(
-        (p) => p.inlineData?.mimeType?.startsWith("audio/")
-      );
+      // Send final transcript to client
+      sendJson(ws, {
+        type: "transcript_final",
+        content: transcript,
+      });
 
-      if (audioParts?.length) {
-        for (const audioPart of audioParts) {
+      // ── Step 3: Send transcription to chat session for AI response ──
+      const chatResult = await chatSession.sendMessage(transcript);
+      const responseText = chatResult.response.text();
+
+      logger.info({ deviceId, responseLength: responseText.length }, "Chat response generated");
+
+      // Send response text to client
+      sendJson(ws, {
+        type: "response_text",
+        content: responseText,
+      });
+
+      // ── Step 4: (Optional) Generate TTS audio for the response ──
+      try {
+        const ttsModel = gemini.getModel("gemini-2.5-flash", {
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: sessionConfig?.voice_name === "default" ? "Kore" : (sessionConfig?.voice_name || "Kore"),
+                },
+              },
+            },
+          },
+        });
+
+        const ttsPrompt = `Turkce olarak soyle: ${responseText}`;
+        const ttsResult = await ttsModel.generateContent(ttsPrompt);
+        const ttsResponse = ttsResult.response;
+
+        const audioPart = ttsResponse.candidates?.[0]?.content?.parts?.find(
+          (p) => p.inlineData?.mimeType?.startsWith("audio/")
+        );
+
+        if (audioPart?.inlineData?.data) {
           const audioData = Buffer.from(audioPart.inlineData.data, "base64");
+          logger.info({ deviceId, audioBytes: audioData.length }, "TTS audio generated");
+
           // Send binary audio to client
           if (ws.readyState === ws.OPEN) {
             ws.send(audioData);
           }
+        } else {
+          logger.debug({ deviceId }, "No TTS audio returned from model");
         }
+      } catch (ttsErr) {
+        // TTS is optional — don't fail the whole response
+        logger.warn({ deviceId, error: ttsErr.message }, "TTS generation failed (non-critical)");
       }
 
       // Signal response end
       sendJson(ws, { type: "response_end" });
     } catch (err) {
-      logger.error({ deviceId, error: err.message }, "Audio processing failed");
+      logger.error({ deviceId, error: err.message, stack: err.stack }, "Audio processing failed");
       sendJson(ws, {
         type: "error",
-        content: err.message || "Audio processing failed",
+        content: err.message || "Ses işleme hatası",
         code: -1,
       });
+    } finally {
+      isProcessing = false;
     }
   }
 
   // ==================== Text Input ====================
 
   async function handleTextInput(text) {
-    if (!session || !text) return;
+    if (!chatSession || !text) return;
+    if (isProcessing) return;
+
+    isProcessing = true;
 
     try {
       sendJson(ws, {
@@ -260,37 +374,54 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
         content: text,
       });
 
-      const result = await session.sendMessage(text);
-      const response = result.response;
-      const responseText = response.text();
+      const result = await chatSession.sendMessage(text);
+      const responseText = result.response.text();
 
       sendJson(ws, {
         type: "response_text",
         content: responseText,
       });
 
-      // Check for audio
-      const audioParts = response.candidates?.[0]?.content?.parts?.filter(
-        (p) => p.inlineData?.mimeType?.startsWith("audio/")
-      );
+      // Optional TTS for text input responses
+      try {
+        const ttsModel = gemini.getModel("gemini-2.5-flash", {
+          generationConfig: {
+            responseModalities: ["AUDIO"],
+            speechConfig: {
+              voiceConfig: {
+                prebuiltVoiceConfig: {
+                  voiceName: sessionConfig?.voice_name === "default" ? "Kore" : (sessionConfig?.voice_name || "Kore"),
+                },
+              },
+            },
+          },
+        });
 
-      if (audioParts?.length) {
-        for (const audioPart of audioParts) {
+        const ttsResult = await ttsModel.generateContent(`Turkce olarak soyle: ${responseText}`);
+        const audioPart = ttsResult.response.candidates?.[0]?.content?.parts?.find(
+          (p) => p.inlineData?.mimeType?.startsWith("audio/")
+        );
+
+        if (audioPart?.inlineData?.data) {
           const audioData = Buffer.from(audioPart.inlineData.data, "base64");
           if (ws.readyState === ws.OPEN) {
             ws.send(audioData);
           }
         }
+      } catch (ttsErr) {
+        logger.warn({ deviceId, error: ttsErr.message }, "TTS generation failed (non-critical)");
       }
 
       sendJson(ws, { type: "response_end" });
     } catch (err) {
-      logger.error({ deviceId, error: err.message }, "Text processing failed");
+      logger.error({ deviceId, error: err.message, stack: err.stack }, "Text processing failed");
       sendJson(ws, {
         type: "error",
         content: err.message,
         code: -1,
       });
+    } finally {
+      isProcessing = false;
     }
   }
 
@@ -300,6 +431,7 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
     logger.debug({ deviceId }, "Barge-in received");
     // Clear any pending audio processing
     audioBuffer = [];
+    audioChunkCount = 0;
     if (silenceTimer) {
       clearTimeout(silenceTimer);
       silenceTimer = null;
@@ -309,9 +441,11 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
   // ==================== Cleanup ====================
 
   function cleanup() {
-    session = null;
+    chatSession = null;
     isSetup = false;
+    isProcessing = false;
     audioBuffer = [];
+    audioChunkCount = 0;
     if (silenceTimer) {
       clearTimeout(silenceTimer);
       silenceTimer = null;
