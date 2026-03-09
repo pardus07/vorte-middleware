@@ -300,8 +300,8 @@ function parseProductPage($, html, logger) {
         // Support both Offer (price) and AggregateOffer (lowPrice/highPrice)
         const offerPrice = ld.offers?.price || ld.offers?.lowPrice || ld.offers?.highPrice;
         if (offerPrice) {
-          product.price = String(offerPrice);
-          product.priceFormatted = `₺${String(offerPrice).replace(".", ",")}`;
+          product.price = String(parseFloat(offerPrice).toFixed(2));
+          product.priceFormatted = `₺${parseFloat(offerPrice).toFixed(2).replace(".", ",")}`;
         }
         if (ld.sku) product.sku = ld.sku;
         if (ld.image) product.image = Array.isArray(ld.image) ? ld.image[0] : ld.image;
@@ -518,8 +518,8 @@ function normalizeProduct(p, category) {
 
   const price = p.price || p.salePrice || p.basePrice;
   if (price) {
-    product.price = String(price);
-    product.priceFormatted = `₺${String(price).replace(".", ",")}`;
+    product.price = String(parseFloat(price).toFixed(2));
+    product.priceFormatted = `₺${parseFloat(price).toFixed(2).replace(".", ",")}`;
   }
 
   if (p.slug) product.url = `/urun/${p.slug}`;
@@ -550,8 +550,8 @@ function extractJsonLdProducts($, category) {
             products.push({
               name: p.name,
               description: p.description || "",
-              priceFormatted: offerPrice ? `₺${offerPrice}` : "",
-              price: offerPrice ? String(offerPrice) : "",
+              priceFormatted: offerPrice ? `₺${parseFloat(offerPrice).toFixed(2).replace(".", ",")}` : "",
+              price: offerPrice ? String(parseFloat(offerPrice).toFixed(2)) : "",
               url: p.url || "",
               category,
             });
