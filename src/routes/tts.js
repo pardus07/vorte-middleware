@@ -33,7 +33,7 @@ router.post("/", async (req, res, next) => {
 
     // Use Gemini's TTS capability via the generative model
     // Configure for audio output
-    const model = req.gemini.getModel("gemini-2.5-flash", {
+    const model = req.gemini.getModel("gemini-2.0-flash", {
       generationConfig: {
         responseModalities: ["AUDIO"],
         speechConfig: {
@@ -63,7 +63,7 @@ router.post("/", async (req, res, next) => {
       const durationMs = Date.now() - start;
       logApiCall(req.log, {
         endpoint: "/api/tts",
-        model: "gemini-2.5-flash",
+        model: "gemini-2.0-flash",
         durationMs,
         inputTokens: 0,
         outputTokens: 0,
@@ -79,7 +79,7 @@ router.post("/", async (req, res, next) => {
       const durationMs = Date.now() - start;
       logApiCall(req.log, {
         endpoint: "/api/tts",
-        model: "gemini-2.5-flash",
+        model: "gemini-2.0-flash",
         durationMs,
         inputTokens: 0,
         outputTokens: 0,
@@ -94,7 +94,7 @@ router.post("/", async (req, res, next) => {
     const durationMs = Date.now() - start;
     logApiCall(req.log, {
       endpoint: "/api/tts",
-      model: "gemini-2.5-flash",
+      model: "gemini-2.0-flash",
       durationMs,
       inputTokens: 0,
       outputTokens: 0,
