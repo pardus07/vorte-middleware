@@ -69,11 +69,14 @@ function pcmToWav(pcmBuffer, sampleRate = 16000, numChannels = 1, bitsPerSample 
   return Buffer.concat([header, pcmBuffer]);
 }
 
+// New SDK for chat with Google Search grounding
+const { GoogleGenAI } = require("@google/genai");
+
 /**
  * Handle a single WebSocket connection for live voice.
  */
 function handleLiveWebSocket(ws, gemini, logger, deviceId) {
-  let chatSession = null;
+  let chatSession = null;  // New SDK chat (with search grounding)
   let isSetup = false;
   let sessionConfig = null;
   let isProcessing = false;
@@ -145,22 +148,19 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
     sessionConfig = config;
 
     try {
-      // Use gemini-2.5-flash for the chat session (text conversation)
-      // With Google Search grounding so AI can look up real prices/data
+      // Use new @google/genai SDK for chat with Google Search grounding
+      const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const chatModelName = "gemini-2.5-flash";
-      const chatModel = gemini.getModel(chatModelName, {
-        generationConfig: {
+
+      chatSession = ai.chats.create({
+        model: chatModelName,
+        config: {
+          tools: [{ googleSearch: {} }],
+          systemInstruction: config.system_prompt || "",
           maxOutputTokens: 2048,
           temperature: 0.7,
         },
-        tools: [{ googleSearch: {} }],
-        ...(config.system_prompt
-          ? { systemInstruction: config.system_prompt }
-          : {}),
       });
-
-      // Start a chat session for multi-turn conversation
-      chatSession = chatModel.startChat({ history: [] });
 
       isSetup = true;
 
@@ -170,8 +170,9 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
           chatModel: chatModelName,
           language: config.language,
           bargeIn: config.enable_barge_in,
+          searchGrounding: true,
         },
-        "Live session setup complete"
+        "Live session setup complete (with Google Search)"
       );
 
       // Client transitions to LISTENING when it receives the Connected event (onOpen)
@@ -360,8 +361,9 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
       });
 
       // ── Step 3: Send transcription to chat session for AI response ──
-      const chatResult = await chatSession.sendMessage(transcript);
-      const responseText = chatResult.response.text();
+      // Uses new @google/genai SDK with Google Search grounding
+      const chatResult = await chatSession.sendMessage({ message: transcript });
+      const responseText = chatResult.text;
 
       logger.info({ deviceId, responseLength: responseText.length }, "Chat response generated");
 
@@ -416,8 +418,8 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
         content: text,
       });
 
-      const result = await chatSession.sendMessage(text);
-      const responseText = result.response.text();
+      const result = await chatSession.sendMessage({ message: text });
+      const responseText = result.text;
 
       sendJson(ws, {
         type: "response_text",
