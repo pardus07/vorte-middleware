@@ -46,7 +46,7 @@ router.post("/", async (req, res, next) => {
       },
     });
 
-    const prompt = `${language === "tr-TR" ? "Turkce olarak" : ""} soyle: ${text}`;
+    const prompt = `Asagidaki Turkce metni dogal ve sicak bir tonla sesli oku:\n\n${text}`;
 
     const result = await model.generateContent(prompt);
     const response = result.response;
@@ -58,7 +58,35 @@ router.post("/", async (req, res, next) => {
     );
 
     if (audioPart?.inlineData?.data) {
-      const audioBuffer = Buffer.from(audioPart.inlineData.data, "base64");
+      // Diagnostic logging
+      const rawData = audioPart.inlineData.data;
+      const dataType = typeof rawData;
+      const mimeType = audioPart.inlineData.mimeType;
+      req.log.info({
+        tts_diag: true,
+        mimeType,
+        dataType,
+        dataLength: rawData.length,
+        isString: dataType === "string",
+        first40chars: dataType === "string" ? rawData.substring(0, 40) : "N/A",
+      }, "TTS audio diagnostic");
+
+      const audioBuffer = Buffer.from(rawData, "base64");
+
+      // Log decoded buffer info
+      const first20hex = audioBuffer.slice(0, 20).toString("hex");
+      // Find first non-zero byte
+      let firstNonZero = -1;
+      for (let i = 0; i < Math.min(audioBuffer.length, 1000); i++) {
+        if (audioBuffer[i] !== 0) { firstNonZero = i; break; }
+      }
+      req.log.info({
+        tts_diag: true,
+        bufferLength: audioBuffer.length,
+        first20hex,
+        firstNonZeroByte: firstNonZero,
+        durationEstSec: (audioBuffer.length / (24000 * 2)).toFixed(1),
+      }, "TTS decoded buffer diagnostic");
 
       const durationMs = Date.now() - start;
       logApiCall(req.log, {
@@ -71,7 +99,7 @@ router.post("/", async (req, res, next) => {
         success: true,
       });
 
-      res.set("Content-Type", audioPart.inlineData.mimeType || "audio/pcm");
+      res.set("Content-Type", mimeType || "audio/pcm");
       res.set("Content-Length", audioBuffer.length);
       res.send(audioBuffer);
     } else {
