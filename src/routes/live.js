@@ -72,6 +72,9 @@ function pcmToWav(pcmBuffer, sampleRate = 16000, numChannels = 1, bitsPerSample 
 // New SDK for chat with Google Search grounding
 const { GoogleGenAI } = require("@google/genai");
 
+// Website scraper for real product data from vorte.com.tr
+const { buildWebsiteContext } = require("../services/websiteScraper");
+
 /**
  * Handle a single WebSocket connection for live voice.
  */
@@ -148,7 +151,28 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
     sessionConfig = config;
 
     try {
-      // Use new @google/genai SDK for chat with Google Search grounding
+      // ── Step 1: Scrape vorte.com.tr for real product data ──
+      let websiteContext = "";
+      try {
+        websiteContext = await buildWebsiteContext(logger);
+        logger.info(
+          { deviceId, contextLength: websiteContext.length },
+          "Website context loaded from vorte.com.tr"
+        );
+      } catch (scrapeErr) {
+        logger.warn(
+          { deviceId, error: scrapeErr.message },
+          "Website scrape failed, continuing without website data"
+        );
+      }
+
+      // ── Step 2: Build enhanced system prompt with website data ──
+      const basePrompt = config.system_prompt || "";
+      const enhancedPrompt = websiteContext
+        ? `${basePrompt}\n\n${websiteContext}\n\nÖNEMLİ: Yukarıdaki web sitesi verileri vorte.com.tr'den doğrudan çekilmiştir. Ürün ve fiyat soruları sorulduğunda BU VERİLERİ KULLAN. Bu veriler gerçek ve günceldir. "Web sitesine erişimim yok" DEME — veriler zaten sana sağlandı.`
+        : basePrompt;
+
+      // ── Step 3: Create chat session with enhanced prompt ──
       const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
       const chatModelName = "gemini-2.5-flash";
 
@@ -156,7 +180,7 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
         model: chatModelName,
         config: {
           tools: [{ googleSearch: {} }],
-          systemInstruction: config.system_prompt || "",
+          systemInstruction: enhancedPrompt,
           maxOutputTokens: 2048,
           temperature: 0.7,
         },
@@ -171,8 +195,10 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
           language: config.language,
           bargeIn: config.enable_barge_in,
           searchGrounding: true,
+          websiteData: !!websiteContext,
+          promptLength: enhancedPrompt.length,
         },
-        "Live session setup complete (with Google Search)"
+        "Live session setup complete (with website data + Google Search)"
       );
 
       // Client transitions to LISTENING when it receives the Connected event (onOpen)

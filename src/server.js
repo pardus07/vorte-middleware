@@ -32,6 +32,7 @@ const searchRoute = require("./routes/search");
 const ttsRoute = require("./routes/tts");
 const embedRoute = require("./routes/embed");
 const { handleLiveWebSocket } = require("./routes/live");
+const scrapeRoute = require("./routes/scrape");
 
 const logger = createLogger();
 const app = express();
@@ -81,6 +82,7 @@ app.use("/api/vision", visionRoute);
 app.use("/api/search", searchRoute);
 app.use("/api/tts", ttsRoute);
 app.use("/api/embed", embedRoute);
+app.use("/api/scrape", scrapeRoute);
 
 // ==================== WebSocket (Gemini Live) ====================
 
@@ -129,7 +131,7 @@ const PORT = parseInt(process.env.PORT || "3000", 10);
 server.listen(PORT, "0.0.0.0", () => {
   logger.info(`Vorte Middleware running on port ${PORT}`);
   logger.info(`Environment: ${process.env.NODE_ENV || "development"}`);
-  logger.info(`Endpoints: chat, vision, search, tts, embed, live(ws)`);
+  logger.info(`Endpoints: chat, vision, search, tts, embed, scrape, live(ws)`);
 });
 
 // Graceful shutdown

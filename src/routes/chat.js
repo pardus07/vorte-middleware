@@ -10,6 +10,7 @@
 
 const express = require("express");
 const { logApiCall } = require("../middleware/logger");
+const { buildWebsiteContext } = require("../services/websiteScraper");
 
 const router = express.Router();
 
@@ -48,9 +49,16 @@ router.post("/", async (req, res, next) => {
     const contents = [];
 
     // System instruction (if provided and no cache)
+    // Enhance with website data from vorte.com.tr
     let systemInstruction;
     if (system_prompt && !cache_id) {
-      systemInstruction = system_prompt;
+      try {
+        const websiteContext = await buildWebsiteContext(req.log);
+        systemInstruction = `${system_prompt}\n\n${websiteContext}\n\nÖNEMLİ: Yukarıdaki web sitesi verileri vorte.com.tr'den doğrudan çekilmiştir. Ürün ve fiyat soruları sorulduğunda BU VERİLERİ KULLAN.`;
+      } catch (scrapeErr) {
+        req.log.warn({ error: scrapeErr.message }, "Website scrape failed for chat, using base prompt");
+        systemInstruction = system_prompt;
+      }
     }
 
     // Convert messages to Gemini format
