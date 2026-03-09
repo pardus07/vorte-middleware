@@ -297,12 +297,16 @@ function parseProductPage($, html, logger) {
       if (ld["@type"] === "Product") {
         product.name = ld.name || "";
         product.description = ld.description || "";
-        if (ld.offers?.price) {
-          product.price = String(ld.offers.price);
-          product.priceFormatted = `₺${String(ld.offers.price).replace(".", ",")}`;
+        // Support both Offer (price) and AggregateOffer (lowPrice/highPrice)
+        const offerPrice = ld.offers?.price || ld.offers?.lowPrice || ld.offers?.highPrice;
+        if (offerPrice) {
+          product.price = String(offerPrice);
+          product.priceFormatted = `₺${String(offerPrice).replace(".", ",")}`;
         }
         if (ld.sku) product.sku = ld.sku;
         if (ld.image) product.image = Array.isArray(ld.image) ? ld.image[0] : ld.image;
+        if (ld.brand?.name) product.brand = ld.brand.name;
+        if (ld.category) product.productCategory = ld.category;
       }
     } catch {}
   });
@@ -542,11 +546,12 @@ function extractJsonLdProducts($, category) {
         for (const item of items) {
           const p = item.item || item;
           if (p.name) {
+            const offerPrice = p.offers?.price || p.offers?.lowPrice || p.offers?.highPrice;
             products.push({
               name: p.name,
               description: p.description || "",
-              priceFormatted: p.offers?.price ? `₺${p.offers.price}` : "",
-              price: p.offers?.price ? String(p.offers.price) : "",
+              priceFormatted: offerPrice ? `₺${offerPrice}` : "",
+              price: offerPrice ? String(offerPrice) : "",
               url: p.url || "",
               category,
             });
