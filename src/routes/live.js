@@ -146,12 +146,14 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
 
     try {
       // Use gemini-2.5-flash for the chat session (text conversation)
+      // With Google Search grounding so AI can look up real prices/data
       const chatModelName = "gemini-2.5-flash";
       const chatModel = gemini.getModel(chatModelName, {
         generationConfig: {
           maxOutputTokens: 2048,
           temperature: 0.7,
         },
+        tools: [{ googleSearch: {} }],
         ...(config.system_prompt
           ? { systemInstruction: config.system_prompt }
           : {}),
@@ -369,39 +371,17 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
         content: responseText,
       });
 
-      // ── Step 4: (Optional) Generate TTS audio for the response ──
+      // ── Step 4: Generate TTS audio using Gemini REST API ──
       try {
-        const ttsModel = gemini.getModel("gemini-2.5-flash", {
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: sessionConfig?.voice_name === "default" ? "Kore" : (sessionConfig?.voice_name || "Kore"),
-                },
-              },
-            },
-          },
-        });
-
-        const ttsPrompt = `Turkce olarak soyle: ${responseText}`;
-        const ttsResult = await ttsModel.generateContent(ttsPrompt);
-        const ttsResponse = ttsResult.response;
-
-        const audioPart = ttsResponse.candidates?.[0]?.content?.parts?.find(
-          (p) => p.inlineData?.mimeType?.startsWith("audio/")
+        const audioData = await generateTtsAudio(
+          responseText,
+          sessionConfig?.voice_name === "default" ? "Kore" : (sessionConfig?.voice_name || "Kore"),
+          logger,
+          deviceId
         );
 
-        if (audioPart?.inlineData?.data) {
-          const audioData = Buffer.from(audioPart.inlineData.data, "base64");
-          logger.info({ deviceId, audioBytes: audioData.length }, "TTS audio generated");
-
-          // Send binary audio to client
-          if (ws.readyState === ws.OPEN) {
-            ws.send(audioData);
-          }
-        } else {
-          logger.debug({ deviceId }, "No TTS audio returned from model");
+        if (audioData && ws.readyState === ws.OPEN) {
+          ws.send(audioData);
         }
       } catch (ttsErr) {
         // TTS is optional — don't fail the whole response
@@ -446,29 +426,14 @@ function handleLiveWebSocket(ws, gemini, logger, deviceId) {
 
       // Optional TTS for text input responses
       try {
-        const ttsModel = gemini.getModel("gemini-2.5-flash", {
-          generationConfig: {
-            responseModalities: ["AUDIO"],
-            speechConfig: {
-              voiceConfig: {
-                prebuiltVoiceConfig: {
-                  voiceName: sessionConfig?.voice_name === "default" ? "Kore" : (sessionConfig?.voice_name || "Kore"),
-                },
-              },
-            },
-          },
-        });
-
-        const ttsResult = await ttsModel.generateContent(`Turkce olarak soyle: ${responseText}`);
-        const audioPart = ttsResult.response.candidates?.[0]?.content?.parts?.find(
-          (p) => p.inlineData?.mimeType?.startsWith("audio/")
+        const audioData = await generateTtsAudio(
+          responseText,
+          sessionConfig?.voice_name === "default" ? "Kore" : (sessionConfig?.voice_name || "Kore"),
+          logger,
+          deviceId
         );
-
-        if (audioPart?.inlineData?.data) {
-          const audioData = Buffer.from(audioPart.inlineData.data, "base64");
-          if (ws.readyState === ws.OPEN) {
-            ws.send(audioData);
-          }
+        if (audioData && ws.readyState === ws.OPEN) {
+          ws.send(audioData);
         }
       } catch (ttsErr) {
         logger.warn({ deviceId, error: ttsErr.message }, "TTS generation failed (non-critical)");
@@ -526,6 +491,66 @@ function sendJson(ws, obj) {
   if (ws.readyState === ws.OPEN) {
     ws.send(JSON.stringify(obj));
   }
+}
+
+/**
+ * Generate TTS audio using Gemini REST API.
+ * Uses gemini-2.5-flash-preview-tts model for natural Turkish voice.
+ * Output: PCM 16-bit, 24kHz, mono.
+ *
+ * @param {string} text Text to convert to speech
+ * @param {string} voiceName Voice name (e.g., "Kore", "Puck", "Aoede")
+ * @param {object} logger Pino logger
+ * @param {string} deviceId Device identifier for logging
+ * @returns {Buffer|null} PCM audio buffer or null on failure
+ */
+async function generateTtsAudio(text, voiceName = "Kore", logger, deviceId) {
+  const apiKey = process.env.GEMINI_API_KEY;
+  if (!apiKey) {
+    logger.error({ deviceId }, "GEMINI_API_KEY not set for TTS");
+    return null;
+  }
+
+  const ttsModelName = "gemini-2.5-flash-preview-tts";
+  const url = `https://generativelanguage.googleapis.com/v1beta/models/${ttsModelName}:generateContent?key=${apiKey}`;
+
+  const body = {
+    contents: [{
+      parts: [{ text: text }]
+    }],
+    generationConfig: {
+      responseModalities: ["AUDIO"],
+      speechConfig: {
+        voiceConfig: {
+          prebuiltVoiceConfig: { voiceName: voiceName }
+        }
+      }
+    }
+  };
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+
+  if (!response.ok) {
+    const errText = await response.text().catch(() => "unknown");
+    logger.error({ deviceId, status: response.status, body: errText.slice(0, 200) }, "TTS REST API error");
+    throw new Error(`TTS API returned ${response.status}`);
+  }
+
+  const result = await response.json();
+  const audioBase64 = result.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
+
+  if (!audioBase64) {
+    logger.warn({ deviceId }, "No audio data in TTS response");
+    return null;
+  }
+
+  const audioBuffer = Buffer.from(audioBase64, "base64");
+  logger.info({ deviceId, audioBytes: audioBuffer.length, durationSec: (audioBuffer.length / 48000).toFixed(1) }, "Gemini TTS audio generated");
+  return audioBuffer;
 }
 
 module.exports = { handleLiveWebSocket };
